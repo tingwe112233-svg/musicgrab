@@ -1,348 +1,9 @@
 import 'dart:async';
-import 'dart:io';
-import 'dart:math' as math;
-import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:just_audio/just_audio.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:youtube_explode_dart/youtube_explode_dart.dart'
-    show YoutubeExplode, Video, StreamContainer, AudioOnlyStreamInfo;
-
-enum JobState { queued, downloading, converting, done, failed, canceled }
-
-class _Canceled implements Exception {}
-
-class Job {
-  Job(this.video, this.kbps);
-  final Video video;
-  final int kbps;
-  JobState state = JobState.queued;
-  double progress = 0;
-  String note = '';
-  bool cancelRequested = false;
-  int attempts = 0;
-  int? sessionId;
-  bool get active =>
-      state == JobState.queued ||
-      state == JobState.downloading ||
-      state == JobState.converting;
-}
-
-String errText(Object e) {
-  final s = e.toString();
-  if (e is TimeoutException ||
-      s.contains('SocketException') ||
-      s.contains('ClientException') ||
-      s.contains('host lookup')) {
-    return 'Koneksi terputus atau lambat. Coba lagi.';
-  }
-  return s.replaceAll('Exception: ', '').split('\n').first;
-}
-
-class Ctl extends ChangeNotifier {
-  final yt = YoutubeExplode();
-  final jobs = <Job>[];
-  bool _running = false, _asked = false;
-  SharedPreferences? _p;
-  int kbps = 128, nameFmt = 1;
-  bool addKbps = true, ascii = true;
-
-  Future<void> init() async {
-    try {
-      final p = await SharedPreferences.getInstance();
-      _p = p;
-      kbps = p.getInt('kbps') ?? 128;
-      nameFmt = p.getInt('nameFmt') ?? 1;
-      addKbps = p.getBool('addKbps') ?? true;
-      ascii = p.getBool('ascii') ?? true;
-    } catch (_) {}
-    notifyListeners();
-  }
-
-  void saveSettings() {
-    final p = _p;
-    if (p != null) {
-      p.setInt('kbps', kbps);
-      p.setInt('nameFmt', nameFmt);
-      p.setBool('addKbps', addKbps);
-      p.setBool('ascii', ascii);
-    }
-    notifyListeners();
-  }
-
-  // ---------- nama file ----------
-  String _clean(String s) {
-    var t = s.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1f]'), ' ');
-    if (ascii) t = t.replaceAll(RegExp(r'[^\x20-\x7E]'), '');
-    return t
-        .replaceAll(RegExp(r'\s+'), ' ')
-        .replaceAll(RegExp(r'^[\s.\-]+|[\s.\-]+$'), '');
-  }
-
-  String buildName(String title, String author, int k) {
-    final t = _clean(title);
-    final a = _clean(author.replaceAll(RegExp(r' - Topic$'), ''));
-    var n = (nameFmt == 0 || a.isEmpty || t.isEmpty)
-        ? (t.isEmpty ? a : t)
-        : (nameFmt == 1 ? '$a - $t' : '$t - $a');
-    if (n.length > 70) n = _clean(n.substring(0, 70));
-    if (n.isEmpty) n = 'lagu';
-    return '$n${addKbps ? '_${k}k' : ''}.mp3';
-  }
-
-  String _unique(String dir, String name) {
-    final base = name.substring(0, name.length - 4);
-    var p = '$dir/$name';
-    for (var i = 2; File(p).existsSync() && i < 1000; i++) {
-      p = '$dir/$base ($i).mp3';
-    }
-    return p;
-  }
-
-  Future<List<Directory>> _outDirs() async {
-    final r = <Directory>[];
-    try {
-      final d = Directory('/storage/emulated/0/Music/YTMP3');
-      await d.create(recursive: true);
-      r.add(d);
-    } catch (_) {}
-    try {
-      final base = await getExternalStorageDirectory() ??
-          await getApplicationDocumentsDirectory();
-      final d = Directory('${base.path}/YTMP3');
-      await d.create(recursive: true);
-      r.add(d);
-    } catch (_) {}
-    return r;
-  }
-
-  Future<void> _del(String p) async {
-    try {
-      final f = File(p);
-      if (await f.exists()) await f.delete();
-    } catch (_) {}
-  }
-
-  // ---------- stream ----------
-  Future<AudioOnlyStreamInfo> pick(Video v) async {
-    final m = await yt.videos.streamsClient
-        .getManifest(v.id)
-        .timeout(const Duration(seconds: 30));
-    if (m.audioOnly.isEmpty) throw 'Audio tidak tersedia untuk video ini';
-    final mp4 = m.audioOnly.where((s) => s.container == StreamContainer.mp4);
-    final l = (mp4.isNotEmpty ? mp4 : m.audioOnly).toList();
-    l.sort((a, b) => b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond));
-    return l.first;
-  }
-
-  // ---------- antrean ----------
-  Future<bool> enqueue(Video v) async {
-    if (jobs.any((j) => j.video.id.value == v.id.value && j.active)) {
-      return false;
-    }
-    jobs.add(Job(v, kbps));
-    notifyListeners();
-    if (!_asked) {
-      _asked = true;
-      try {
-        await [Permission.audio, Permission.storage, Permission.notification]
-            .request();
-      } catch (_) {}
-    }
-    unawaited(_pump());
-    return true;
-  }
-
-  Future<void> cancel(Job j) async {
-    if (j.state == JobState.queued) {
-      j.state = JobState.canceled;
-    } else if (j.state == JobState.downloading ||
-        j.state == JobState.converting) {
-      j.cancelRequested = true;
-      if (j.state == JobState.converting) {
-        try {
-          await FFmpegKit.cancel(j.sessionId);
-        } catch (_) {}
-      }
-    }
-    notifyListeners();
-  }
-
-  void cancelAll() {
-    for (final j in List<Job>.from(jobs)) {
-      if (j.active) unawaited(cancel(j));
-    }
-  }
-
-  void clearFinished() {
-    jobs.removeWhere((j) => !j.active);
-    notifyListeners();
-  }
-
-  void retry(Job j) {
-    if (j.active) return;
-    j.state = JobState.queued;
-    j.cancelRequested = false;
-    j.attempts = 0;
-    j.progress = 0;
-    j.note = '';
-    notifyListeners();
-    unawaited(_pump());
-  }
-
-  Future<void> _svc(bool on) async {
-    try {
-      if (on) {
-        await FlutterForegroundTask.startService(
-          serviceId: 256,
-          notificationTitle: 'MusicGrab MP3',
-          notificationText: 'Memproses antrean...',
-        );
-      } else {
-        await FlutterForegroundTask.stopService();
-      }
-    } catch (_) {}
-  }
-
-  void _notif(String t) {
-    try {
-      unawaited(FlutterForegroundTask.updateService(notificationText: t)
-          .then((_) {}, onError: (_) {}));
-    } catch (_) {}
-  }
-
-  Future<void> _pump() async {
-    if (_running) return;
-    _running = true;
-    try {
-      await _svc(true);
-      while (true) {
-        final i = jobs.indexWhere((j) => j.state == JobState.queued);
-        if (i < 0) break;
-        final j = jobs[i];
-        await _run(j);
-        if (j.state == JobState.failed && j.attempts < 2) {
-          await Future.delayed(const Duration(seconds: 3));
-          if (j.state == JobState.failed) {
-            j.state = JobState.queued;
-            notifyListeners();
-          }
-        }
-      }
-    } catch (_) {
-    } finally {
-      await _svc(false);
-      _running = false;
-    }
-    if (jobs.any((j) => j.state == JobState.queued)) unawaited(_pump());
-  }
-
-  Future<ReturnCode?> _ffmpeg(Job j, String inp, String out) async {
-    final done = Completer<ReturnCode?>();
-    final s = await FFmpegKit.executeWithArgumentsAsync([
-      '-y', '-i', inp, '-vn', '-map_metadata', '-1',
-      '-c:a', 'libmp3lame', '-b:a', '${j.kbps}k', // CBR
-      '-ar', '44100', '-ac', '2',
-      '-write_xing', '0', '-id3v2_version', '0',
-      out,
-    ], (ss) async {
-      final rc = await ss.getReturnCode();
-      if (!done.isCompleted) done.complete(rc);
-    });
-    j.sessionId = s.getSessionId();
-    if (j.cancelRequested) await FFmpegKit.cancel(j.sessionId);
-    return done.future.timeout(const Duration(minutes: 10), onTimeout: () {
-      FFmpegKit.cancel(j.sessionId);
-      return null;
-    });
-  }
-
-  Future<void> _run(Job j) async {
-    File? tmp;
-    String? out;
-    j.attempts++;
-    j.note = '';
-    j.progress = 0;
-    j.state = JobState.downloading;
-    notifyListeners();
-    try {
-      _notif(j.video.title);
-      final s = await pick(j.video);
-      if (j.cancelRequested) throw _Canceled();
-      final f = File(
-          '${(await getTemporaryDirectory()).path}/${j.video.id.value}.src');
-      tmp = f;
-      if (await f.exists()) await f.delete();
-      final sink = f.openWrite();
-      final total = s.size.totalBytes;
-      var got = 0, last = -1;
-      try {
-        await for (final c in yt.videos.streamsClient
-            .get(s)
-            .timeout(const Duration(seconds: 25))) {
-          if (j.cancelRequested) break;
-          sink.add(c);
-          got += c.length;
-          if (total > 0) {
-            j.progress = math.min(1.0, got / total);
-            final pc = (j.progress * 100).floor();
-            if (pc != last) {
-              last = pc;
-              notifyListeners();
-              if (pc % 10 == 0) _notif('${j.video.title} - $pc%');
-            }
-          }
-        }
-      } finally {
-        await sink.close();
-      }
-      if (j.cancelRequested) throw _Canceled();
-      if (got == 0 || (total > 0 && got < total * 0.98)) {
-        throw 'Unduhan tidak lengkap';
-      }
-
-      j.state = JobState.converting;
-      notifyListeners();
-      var ok = false;
-      for (final d in await _outDirs()) {
-        final path =
-            _unique(d.path, buildName(j.video.title, j.video.author, j.kbps));
-        out = path;
-        final rc = await _ffmpeg(j, f.path, path);
-        if (j.cancelRequested || ReturnCode.isCancel(rc)) throw _Canceled();
-        if (ReturnCode.isSuccess(rc) &&
-            File(path).existsSync() &&
-            File(path).lengthSync() > 1024) {
-          ok = true;
-          break;
-        }
-        await _del(path);
-      }
-      if (!ok) throw 'Konversi gagal atau folder tidak bisa ditulis';
-      j.note = out ?? '';
-      j.state = JobState.done;
-    } on _Canceled {
-      j.state = JobState.canceled;
-    } catch (e) {
-      j.state = JobState.failed;
-      j.note = errText(e);
-    } finally {
-      try {
-        await tmp?.delete();
-      } catch (_) {}
-      final o = out;
-      if (o != null && j.state != JobState.done) await _del(o);
-      j.sessionId = null;
-      notifyListeners();
-    }
-  }
-}
-
-// ======================= UI =======================
+import 'package:youtube_explode_dart/youtube_explode_dart.dart' show Video;
+import 'ctl.dart';
 
 void main() {
   runZonedGuarded(() async {
@@ -426,6 +87,16 @@ class SearchTab extends StatefulWidget {
 }
 
 class _SearchTabState extends State<SearchTab> {
+  static const _cats = <String, String>{
+    'Terpopuler': 'lagu terpopuler Indonesia 2026',
+    'Pop': 'lagu pop Indonesia terbaru',
+    'Dangdut': 'dangdut terbaru 2026',
+    'DJ Remix': 'dj remix terbaru 2026',
+    'Rock': 'lagu rock Indonesia',
+    'Religi': 'sholawat religi terbaru',
+    'Barat': 'top english songs 2026',
+  };
+
   final _q = TextEditingController();
   final _player = AudioPlayer();
   List<Video> _items = [];
@@ -452,6 +123,9 @@ class _SearchTabState extends State<SearchTab> {
         _toast('Preview gagal diputar.');
       }
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _search(_cats.values.first);
+    });
   }
 
   @override
@@ -470,8 +144,8 @@ class _SearchTabState extends State<SearchTab> {
     m.showSnackBar(SnackBar(content: Text(s)));
   }
 
-  Future<void> _search() async {
-    final q = _q.text.trim();
+  Future<void> _search([String? preset]) async {
+    final q = (preset ?? _q.text).trim();
     if (q.isEmpty) return;
     FocusScope.of(context).unfocus();
     final my = ++_seq;
@@ -510,9 +184,9 @@ class _SearchTabState extends State<SearchTab> {
         _playing = id;
         _prep = true;
       });
-      final s = await widget.ctl.pick(v);
+      final s = await widget.ctl.previewSrc(v);
       if (tok != _ptok || !mounted) return;
-      await _player.setUrl(s.url.toString());
+      await _player.setUrl(s.url, headers: s.headers);
       if (tok != _ptok || !mounted) return;
       setState(() => _prep = false);
       unawaited(_player.play());
@@ -546,6 +220,26 @@ class _SearchTabState extends State<SearchTab> {
           IconButton(onPressed: _search, icon: const Icon(Icons.search)),
         ]),
       ),
+      SizedBox(
+        height: 48,
+        child: ListView(
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          children: [
+            for (final e in _cats.entries)
+              Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: ActionChip(
+                  label: Text(e.key),
+                  onPressed: () {
+                    _q.clear();
+                    _search(e.value);
+                  },
+                ),
+              ),
+          ],
+        ),
+      ),
       Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12),
         child: ListenableBuilder(
@@ -571,7 +265,10 @@ class _SearchTabState extends State<SearchTab> {
       if (_loading) const LinearProgressIndicator(),
       Expanded(
         child: _items.isEmpty
-            ? const Center(child: Text('Ketik judul lagu lalu tekan cari'))
+            ? Center(
+                child: Text(_loading
+                    ? 'Memuat...'
+                    : 'Ketik judul lagu lalu tekan cari'))
             : ListenableBuilder(
                 listenable: c,
                 builder: (_, __) => ListView.separated(
@@ -637,18 +334,21 @@ class QueueTab extends StatelessWidget {
   final Ctl ctl;
 
   String _label(Job j) {
+    if (j.cancelRequested && j.active) return 'Membatalkan...';
     switch (j.state) {
       case JobState.queued:
         return 'Menunggu antrean';
       case JobState.downloading:
-        return 'Mengunduh ${(j.progress * 100).floor()}%';
+        return j.progress == 0
+            ? 'Menghubungi YouTube...'
+            : 'Mengunduh ${(j.progress * 100).floor()}%';
       case JobState.converting:
         return 'Konversi ke MP3 ${j.kbps} kbps...';
       case JobState.done:
         return 'Selesai: ${j.note}';
       case JobState.failed:
         return 'Gagal: ${j.note}';
-            case JobState.canceled:
+      case JobState.canceled:
         return 'Dibatalkan';
     }
   }
@@ -688,12 +388,13 @@ class QueueTab extends StatelessWidget {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(_label(j),
-                            maxLines: 2, overflow: TextOverflow.ellipsis),
+                            maxLines: 3, overflow: TextOverflow.ellipsis),
                         if (busy)
                           Padding(
                             padding: const EdgeInsets.only(top: 4),
                             child: LinearProgressIndicator(
-                                value: j.state == JobState.downloading
+                                value: (j.state == JobState.downloading &&
+                                        j.progress > 0)
                                     ? j.progress
                                     : null),
                           ),
@@ -767,6 +468,22 @@ class SettingsTab extends StatelessWidget {
           Text('Contoh: ${ctl.buildName('Judul Lagu', 'Nama Artis', ctl.kbps)}'),
           const SizedBox(height: 8),
           const Text('Folder: Music/YTMP3\nFormat: MP3 CBR, 44100 Hz, stereo'),
+          const Divider(height: 32),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.system_update),
+            title: const Text('Perbarui mesin yt-dlp'),
+            subtitle: const Text(
+                'Tap kalau unduhan gagal karena YouTube berubah (butuh internet)'),
+            onTap: () async {
+              final m = ScaffoldMessenger.of(context);
+              m.showSnackBar(
+                  const SnackBar(content: Text('Memperbarui, mohon tunggu...')));
+              final r = await ctl.updateEngine();
+              m.clearSnackBars();
+              m.showSnackBar(SnackBar(content: Text(r)));
+            },
+          ),
         ],
       ),
     );
