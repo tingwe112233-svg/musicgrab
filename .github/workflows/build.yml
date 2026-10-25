@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -27,6 +30,89 @@ jobs:
 
       - name: Set minSdk 24 (syarat FFmpeg)
         run: sed -i 's/flutter\.minSdkVersion/24/' android/app/build.gradle*
+
+      - name: Pasang yt-dlp (gradle + Kotlin)
+        run: |
+          sed -i '0,/^android {/s//android {\n    packaging { jniLibs { useLegacyPackaging = true } }/' android/app/build.gradle.kts
+          printf '\ndependencies {\n    implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")\n}\n' >> android/app/build.gradle.kts
+          mkdir -p android/app/src/main/kotlin/com/musicgrab/musicgrab
+          cat > android/app/src/main/kotlin/com/musicgrab/musicgrab/MainActivity.kt <<'EOF'
+          package com.musicgrab.musicgrab
+
+          import android.os.Handler
+          import android.os.Looper
+          import com.yausername.youtubedl_android.YoutubeDL
+          import com.yausername.youtubedl_android.YoutubeDLRequest
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import java.util.concurrent.Executors
+
+          class MainActivity : FlutterActivity() {
+              private val ui = Handler(Looper.getMainLooper())
+              private val pool = Executors.newCachedThreadPool()
+              private var ch: MethodChannel? = null
+              private var ready = false
+
+              @Synchronized
+              private fun ensureInit() {
+                  if (!ready) {
+                      YoutubeDL.getInstance().init(application)
+                      ready = true
+                  }
+              }
+
+              private fun base(url: String): YoutubeDLRequest {
+                  val r = YoutubeDLRequest(url)
+                  r.addOption("--no-playlist")
+                  r.addOption("--socket-timeout", "20")
+                  r.addOption("-f", "bestaudio[ext=m4a]/bestaudio/best")
+                  return r
+              }
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  val c = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "musicgrab/ytdlp")
+                  ch = c
+                  c.setMethodCallHandler { call, result ->
+                      if (call.method == "cancel") {
+                          try {
+                              YoutubeDL.getInstance().destroyProcessById(call.argument<String>("id") ?: "")
+                          } catch (e: Throwable) {
+                          }
+                          result.success(true)
+                      } else {
+                          pool.execute {
+                              try {
+                                  ensureInit()
+                                  val out: String = when (call.method) {
+                                      "update" -> YoutubeDL.getInstance().updateYoutubeDL(application)?.toString() ?: "ok"
+                                      "info" -> {
+                                          val r = base(call.argument<String>("url")!!)
+                                          r.addOption("-j")
+                                          YoutubeDL.getInstance().execute(r).out
+                                      }
+                                      "download" -> {
+                                          val id = call.argument<String>("id")!!
+                                          val r = base(call.argument<String>("url")!!)
+                                          r.addOption("-o", call.argument<String>("out")!!)
+                                          YoutubeDL.getInstance().execute(r, id) { p, _, _ ->
+                                              ui.post { ch?.invokeMethod("progress", mapOf("id" to id, "p" to p.toDouble())) }
+                                          }
+                                          "ok"
+                                      }
+                                      else -> "?"
+                                  }
+                                  ui.post { result.success(out) }
+                              } catch (e: Throwable) {
+                                  ui.post { result.error("ERR", e.message ?: e.toString(), null) }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
 
       - name: Tulis AndroidManifest.xml
         run: |
@@ -64,3 +150,10 @@ jobs:
         with:
           name: MusicGrab-APK
           path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish ke Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest build/app/outputs/flutter-apk/app-release.apk --title "MusicGrab terbaru" --notes "Build otomatis"
