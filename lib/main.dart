@@ -648,4 +648,127 @@ class QueueTab extends StatelessWidget {
         return 'Selesai: ${j.note}';
       case JobState.failed:
         return 'Gagal: ${j.note}';
-      case JobState.cancel
+            case JobState.canceled:
+        return 'Dibatalkan';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: ctl,
+      builder: (context, _) {
+        final jobs = ctl.jobs;
+        if (jobs.isEmpty) {
+          return const Center(child: Text('Antrean kosong'));
+        }
+        return Column(children: [
+          Row(children: [
+            TextButton.icon(
+                onPressed: ctl.cancelAll,
+                icon: const Icon(Icons.cancel),
+                label: const Text('Batalkan semua')),
+            TextButton.icon(
+                onPressed: ctl.clearFinished,
+                icon: const Icon(Icons.cleaning_services),
+                label: const Text('Bersihkan selesai')),
+          ]),
+          Expanded(
+            child: ListView.separated(
+              itemCount: jobs.length,
+              separatorBuilder: (_, __) => const Divider(height: 1),
+              itemBuilder: (_, i) {
+                final j = jobs[i];
+                final busy = j.state == JobState.downloading ||
+                    j.state == JobState.converting;
+                return ListTile(
+                  title: Text(j.video.title,
+                      maxLines: 2, overflow: TextOverflow.ellipsis),
+                  subtitle: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(_label(j),
+                            maxLines: 2, overflow: TextOverflow.ellipsis),
+                        if (busy)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: LinearProgressIndicator(
+                                value: j.state == JobState.downloading
+                                    ? j.progress
+                                    : null),
+                          ),
+                      ]),
+                  trailing: j.active
+                      ? IconButton(
+                          icon: const Icon(Icons.close),
+                          tooltip: 'Batal',
+                          onPressed: () => ctl.cancel(j))
+                      : (j.state == JobState.done
+                          ? const Icon(Icons.check_circle, color: Colors.green)
+                          : IconButton(
+                              icon: const Icon(Icons.refresh),
+                              tooltip: 'Coba lagi',
+                              onPressed: () => ctl.retry(j))),
+                );
+              },
+            ),
+          ),
+        ]);
+      },
+    );
+  }
+}
+
+class SettingsTab extends StatelessWidget {
+  const SettingsTab({super.key, required this.ctl});
+  final Ctl ctl;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: ctl,
+      builder: (context, _) => ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text('Format nama file'),
+          DropdownButton<int>(
+            isExpanded: true,
+            value: ctl.nameFmt,
+            items: const [
+              DropdownMenuItem(value: 0, child: Text('Judul')),
+              DropdownMenuItem(value: 1, child: Text('Artis - Judul')),
+              DropdownMenuItem(value: 2, child: Text('Judul - Artis')),
+            ],
+            onChanged: (v) {
+              ctl.nameFmt = v ?? 1;
+              ctl.saveSettings();
+            },
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Tambah bitrate di nama (_128k)'),
+            value: ctl.addKbps,
+            onChanged: (v) {
+              ctl.addKbps = v;
+              ctl.saveSettings();
+            },
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Hanya karakter ASCII'),
+            subtitle: const Text('Aman untuk tape/head unit jadul'),
+            value: ctl.ascii,
+            onChanged: (v) {
+              ctl.ascii = v;
+              ctl.saveSettings();
+            },
+          ),
+          const SizedBox(height: 12),
+          Text('Contoh: ${ctl.buildName('Judul Lagu', 'Nama Artis', ctl.kbps)}'),
+          const SizedBox(height: 8),
+          const Text('Folder: Music/YTMP3\nFormat: MP3 CBR, 44100 Hz, stereo'),
+        ],
+      ),
+    );
+  }
+}
