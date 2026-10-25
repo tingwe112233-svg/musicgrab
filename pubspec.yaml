@@ -1,0 +1,21 @@
+name: musicgrab
+description: Cari, putar, dan unduh MP3 (CBR) dari YouTube
+publish_to: none
+version: 1.1.0+2
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  youtube_explode_dart: any
+  just_audio: ^0.9.40
+  ffmpeg_kit_flutter_new_audio: ^2.3.1
+  flutter_foreground_task: ^9.0.0
+  permission_handler: ^12.0.0
+  path_provider: ^2.1.4
+  shared_preferences: ^2.3.0
+
+flutter:
+  uses-material-design: true
